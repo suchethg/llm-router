@@ -300,8 +300,10 @@ func percentileIndex(n int, p float64) int {
 func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond) }
 
 // report prints a side-by-side table of summaries written with -json.
+// Several files with the same label (repeated runs of one policy) are
+// combined into one row showing the mean and the min-max range.
 func report(files []string) {
-	fmt.Printf("%-14s %8s %8s %10s %10s %10s %8s\n", "policy", "req/s", "errors", "TTFT p50", "TTFT p90", "TTFT p99", "hit rate")
+	var sums []summary
 	for _, f := range files {
 		b, err := os.ReadFile(f)
 		if err != nil {
@@ -311,13 +313,63 @@ func report(files []string) {
 		if err := json.Unmarshal(b, &s); err != nil {
 			log.Fatalf("%s: %v", f, err)
 		}
-		hit := "-"
-		if s.HitRate != nil {
-			hit = fmt.Sprintf("%.1f%%", *s.HitRate*100)
-		}
-		fmt.Printf("%-14s %8.1f %8d %8.0fms %8.0fms %8.0fms %8s\n", s.Label, s.RequestsPerSec, s.Errors,
-			s.TTFTms["p50"], s.TTFTms["p90"], s.TTFTms["p99"], hit)
+		sums = append(sums, s)
 	}
+	printReport(os.Stdout, sums)
+}
+
+func printReport(w io.Writer, sums []summary) {
+	var labels []string
+	byLabel := map[string][]summary{}
+	for _, s := range sums {
+		if _, seen := byLabel[s.Label]; !seen {
+			labels = append(labels, s.Label)
+		}
+		byLabel[s.Label] = append(byLabel[s.Label], s)
+	}
+
+	fmt.Fprintf(w, "%-14s %4s %7s %6s  %-18s %-18s %-18s %-18s\n",
+		"policy", "runs", "req/s", "errors", "TTFT p50 ms", "TTFT p90 ms", "TTFT p99 ms", "hit rate %")
+	for _, label := range labels {
+		runs := byLabel[label]
+		pick := func(f func(summary) float64) []float64 {
+			var out []float64
+			for _, s := range runs {
+				out = append(out, f(s))
+			}
+			return out
+		}
+		errs := 0
+		for _, s := range runs {
+			errs += s.Errors
+		}
+		hit := "-"
+		if runs[0].HitRate != nil {
+			hit = spread(pick(func(s summary) float64 { return *s.HitRate * 100 }), "%.1f")
+		}
+		fmt.Fprintf(w, "%-14s %4d %7.1f %6d  %-18s %-18s %-18s %-18s\n",
+			label, len(runs), mean(pick(func(s summary) float64 { return s.RequestsPerSec })), errs,
+			spread(pick(func(s summary) float64 { return s.TTFTms["p50"] }), "%.0f"),
+			spread(pick(func(s summary) float64 { return s.TTFTms["p90"] }), "%.0f"),
+			spread(pick(func(s summary) float64 { return s.TTFTms["p99"] }), "%.0f"),
+			hit)
+	}
+}
+
+// spread formats one value as-is, or several as "mean (min-max)".
+func spread(vs []float64, format string) string {
+	if len(vs) == 1 {
+		return fmt.Sprintf(format, vs[0])
+	}
+	return fmt.Sprintf(format+" ("+format+"-"+format+")", mean(vs), slices.Min(vs), slices.Max(vs))
+}
+
+func mean(vs []float64) float64 {
+	total := 0.0
+	for _, v := range vs {
+		total += v
+	}
+	return total / float64(len(vs))
 }
 
 // counters are summed over replicas. vLLM counts in tokens; the ratio is

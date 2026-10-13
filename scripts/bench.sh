@@ -6,6 +6,12 @@
 #   scripts/bench.sh prefix-aware            # just one
 #   LOADGEN_ARGS="-rate 3" ROUTER_ARGS="-load-slack 2" scripts/bench.sh
 #   BACKEND=vllm REPLICAS=2 scripts/bench.sh # real vLLM (vllm-metal on a Mac)
+#   RUNS=3 scripts/bench.sh                  # repeat; report shows mean (min-max)
+#
+# Repeated runs use seeds 1..RUNS, so each run is a different workload and
+# the spread covers workload variation, not just timing noise. Policies take
+# turns within each round, so slow drift (heat, background apps) hits all
+# of them alike.
 #
 # With BACKEND=vllm, ROUTER_ARGS should include -cache-blocks matching the
 # replicas' real KV cache (vLLM logs "KV cache size: N tokens"; blocks are
@@ -15,6 +21,7 @@ cd "$(dirname "$0")/.."
 
 [ $# -gt 0 ] || set -- round-robin least-load prefix-aware
 BACKEND=${BACKEND:-mock}
+RUNS=${RUNS:-1}
 REPLICAS=${REPLICAS:-4}
 MODEL=${MODEL:-mlx-community/Qwen3-0.6B-4bit}
 # Settings that fit 2 replicas of the 4-bit 0.6B model on an 18 GB Mac.
@@ -59,19 +66,24 @@ start_replicas() {
   done
 }
 
+results=()
+for run in $(seq 1 "$RUNS"); do
 for policy in "$@"; do
   start_replicas
   ./bin/router -addr 127.0.0.1:8090 -backends "$backends" -policy "$policy" ${ROUTER_ARGS:-} 2>/dev/null &
   pids+=($!)
   wait_up http://127.0.0.1:8090/healthz $! 10
 
-  echo "--- $policy ($BACKEND x$REPLICAS)"
+  echo "--- $policy ($BACKEND x$REPLICAS, run $run/$RUNS)"
   model=()
   [ "$BACKEND" = vllm ] && model=(-model "$MODEL")
-  ./bin/loadgen -target http://127.0.0.1:8090 -label "$policy" -json "$OUT/$policy.json" \
+  result="$OUT/$policy-run$run.json"
+  ./bin/loadgen -target http://127.0.0.1:8090 -label "$policy" -json "$result" -seed "$run" \
     -metrics "$metrics" ${model[@]+"${model[@]}"} ${LOADGEN_ARGS:-}
+  results+=("$result")
   stop
+done
 done
 
 echo
-./bin/loadgen report $(printf "$OUT/%s.json " "$@")
+./bin/loadgen report "${results[@]}"

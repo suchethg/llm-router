@@ -171,3 +171,27 @@ func TestSameSeedSameWorkload(t *testing.T) {
 		t.Fatalf("two runs with the same seed sent different first turns (%d vs %d)", len(a), len(b))
 	}
 }
+
+func TestReportCombinesRuns(t *testing.T) {
+	hr := func(v float64) *float64 { return &v }
+	sums := []summary{
+		{Label: "round-robin", RequestsPerSec: 5, TTFTms: map[string]float64{"p50": 90, "p90": 200, "p99": 500}, HitRate: hr(0.70)},
+		{Label: "prefix-aware", RequestsPerSec: 5, Errors: 1, TTFTms: map[string]float64{"p50": 60, "p90": 100, "p99": 200}, HitRate: hr(0.84)},
+		{Label: "prefix-aware", RequestsPerSec: 6, Errors: 2, TTFTms: map[string]float64{"p50": 70, "p90": 110, "p99": 260}, HitRate: hr(0.86)},
+	}
+	var b strings.Builder
+	printReport(&b, sums)
+	lines := strings.Split(strings.TrimSpace(b.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("want header + 2 rows, got:\n%s", b.String())
+	}
+	rr, pa := strings.Fields(lines[1]), lines[2]
+	if rr[0] != "round-robin" || rr[1] != "1" || rr[6] != "500" || rr[7] != "70.0" {
+		t.Errorf("single run row = %q", lines[1])
+	}
+	for _, want := range []string{"prefix-aware", " 2 ", "5.5", " 3 ", "65 (60-70)", "230 (200-260)", "85.0 (84.0-86.0)"} {
+		if !strings.Contains(pa, want) {
+			t.Errorf("combined row %q missing %q", pa, want)
+		}
+	}
+}
