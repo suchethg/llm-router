@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/suchethg/llm-router/internal/backend"
 	"github.com/suchethg/llm-router/internal/policy"
@@ -112,11 +113,80 @@ func TestSpreadsAcrossBackends(t *testing.T) {
 	}
 }
 
-func newRouter(t *testing.T, urls ...string) http.Handler {
+// The in-flight count must cover the whole stream and drop back to zero
+// when it ends, including when the client disconnects mid-stream.
+func TestInflightCoversStreamAndReleases(t *testing.T) {
+	release := make(chan struct{})
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		fmt.Fprint(w, "data: first\n\n")
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+			fmt.Fprint(w, "data: [DONE]\n\n")
+		case <-r.Context().Done(): // client went away
+		}
+	}))
+	defer upstream.Close()
+	bs := parse(t, upstream.URL)
+	router := httptest.NewServer(newHandler(bs, &policy.RoundRobin{}))
+	defer router.Close()
+
+	open := func() *http.Response {
+		resp := post(t, router.URL, `{}`)
+		bufio.NewReader(resp.Body).ReadString('\n') // stream has started
+		return resp
+	}
+
+	// Finished normally.
+	resp := open()
+	if n := bs[0].Inflight(); n != 1 {
+		t.Fatalf("inflight mid-stream = %d, want 1", n)
+	}
+	close(release)
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	waitInflight(t, bs[0], 0)
+
+	// Client disconnects mid-stream.
+	release = make(chan struct{})
+	resp = open()
+	resp.Body.Close()
+	waitInflight(t, bs[0], 0)
+}
+
+// The router releases after ServeHTTP returns, which races with the
+// client's view of the response ending, so poll briefly.
+func waitInflight(t *testing.T, b *backend.Backend, want int64) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for b.Inflight() != want {
+		if time.Now().After(deadline) {
+			t.Fatalf("inflight = %d, want %d", b.Inflight(), want)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func post(t *testing.T, url, body string) *http.Response {
+	t.Helper()
+	resp, err := http.Post(url+"/v1/chat/completions", "application/json", strings.NewReader(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resp
+}
+
+func parse(t *testing.T, urls ...string) []*backend.Backend {
 	t.Helper()
 	bs, err := backend.ParseList(strings.Join(urls, ","))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return newHandler(bs, &policy.RoundRobin{})
+	return bs
+}
+
+func newRouter(t *testing.T, urls ...string) http.Handler {
+	t.Helper()
+	return newHandler(parse(t, urls...), &policy.RoundRobin{})
 }

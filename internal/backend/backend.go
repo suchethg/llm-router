@@ -6,6 +6,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"strings"
+	"sync/atomic"
 )
 
 // Backend is one vLLM replica.
@@ -13,7 +14,18 @@ type Backend struct {
 	Name  string // host:port, used in logs and the X-Routed-To header
 	URL   *url.URL
 	Proxy *httputil.ReverseProxy
+
+	// Requests this router has sent and not yet finished streaming. Tracked
+	// locally rather than scraped from vllm:num_requests_running, which is
+	// seconds stale: in that window every request would see the same "idle"
+	// replica and pile onto it. With several router replicas, each sees
+	// only its own share of the load.
+	inflight atomic.Int64
 }
+
+func (b *Backend) Inflight() int64 { return b.inflight.Load() }
+func (b *Backend) Acquire()        { b.inflight.Add(1) }
+func (b *Backend) Release()        { b.inflight.Add(-1) }
 
 // New builds a backend from a base URL such as "http://10.0.0.5:8000".
 func New(rawURL string) (*Backend, error) {

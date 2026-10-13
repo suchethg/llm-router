@@ -10,8 +10,10 @@ test:
 run-mocks: build
 	for i in 1 2 3 4; do ./bin/mockvllm -addr :800$$i -name mock-$$i & done
 
+POLICY ?= round-robin
+
 run-router: build
-	./bin/router
+	./bin/router -policy $(POLICY)
 
 stop:
 	-pkill -f bin/mockvllm

@@ -58,3 +58,39 @@ func TestRoundRobinConcurrentEven(t *testing.T) {
 		}
 	}
 }
+
+func TestLeastLoadPicksIdlest(t *testing.T) {
+	bs := backends(t, 3)
+	bs[0].Acquire()
+	bs[0].Acquire()
+	bs[2].Acquire()
+	if got := (&LeastLoad{}).Pick(bs); got != bs[1] {
+		t.Fatalf("picked %s (inflight %d), want idle %s", got.Name, got.Inflight(), bs[1].Name)
+	}
+}
+
+// Requests that stay in flight should fill backends evenly, earliest first
+// on ties.
+func TestLeastLoadSpreadsAsLoadBuilds(t *testing.T) {
+	bs := backends(t, 3)
+	p := &LeastLoad{}
+	for i := 0; i < 6; i++ {
+		b := p.Pick(bs)
+		if want := bs[i%3]; b != want {
+			t.Fatalf("pick %d = %s, want %s", i, b.Name, want.Name)
+		}
+		b.Acquire()
+	}
+}
+
+func TestNew(t *testing.T) {
+	for _, name := range []string{"round-robin", "least-load"} {
+		p, err := New(name)
+		if err != nil || p.Name() != name {
+			t.Errorf("New(%q) = %v, %v", name, p, err)
+		}
+	}
+	if _, err := New("random"); err == nil {
+		t.Error("New(\"random\") should fail")
+	}
+}
