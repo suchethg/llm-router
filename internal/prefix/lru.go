@@ -19,6 +19,22 @@ func NewLRU(capacity int) *LRU {
 	return &LRU{cap: capacity, ll: list.New(), items: make(map[uint64]*list.Element)}
 }
 
+// Match returns how many leading blocks are cached, without inserting them
+// or changing their recency, so asking "how much would this replica reuse?"
+// of every replica doesn't disturb the caches of the ones not chosen.
+func (c *LRU) Match(hashes []uint64) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, h := range hashes {
+		if _, ok := c.items[h]; !ok {
+			break
+		}
+		n++
+	}
+	return n
+}
+
 // MatchAndInsert returns how many leading blocks were already cached, then
 // caches all of them (the request's prefill computes the missing ones).
 // As in vLLM, a hit only counts while the prefix is unbroken: after the

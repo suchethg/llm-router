@@ -113,6 +113,63 @@ func TestSpreadsAcrossBackends(t *testing.T) {
 	}
 }
 
+// Bodies the router can't parse are still forwarded byte for byte, so the
+// replica can answer with its own error.
+func TestForwardsUnparseableBody(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		io.Copy(w, r.Body)
+	}))
+	defer upstream.Close()
+	router := httptest.NewServer(newRouter(t, upstream.URL))
+	defer router.Close()
+
+	for _, body := range []string{`not json`, `{"messages":"wrong type"}`, ``} {
+		resp := post(t, router.URL, body)
+		got, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if string(got) != body {
+			t.Errorf("forwarded %q, want %q", got, body)
+		}
+	}
+}
+
+func TestRejectsOversizedBody(t *testing.T) {
+	router := httptest.NewServer(newRouter(t, "http://127.0.0.1:1"))
+	defer router.Close()
+	resp := post(t, router.URL, strings.Repeat("x", maxBody+1))
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status %d, want 413", resp.StatusCode)
+	}
+}
+
+// End to end through HTTP: every turn of a conversation reaches the same
+// replica, because the router parsed the messages out of the body.
+func TestPrefixAwareRoutesConversationToOneReplica(t *testing.T) {
+	var urls []string
+	for i := 0; i < 4; i++ {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+		defer srv.Close()
+		urls = append(urls, srv.URL)
+	}
+	router := httptest.NewServer(newHandler(parse(t, urls...), policy.NewPrefixAware(policy.DefaultOptions())))
+	defer router.Close()
+
+	msgs := `{"role":"system","content":"` + strings.Repeat("You are a support agent. ", 40) + `"}`
+	var first string
+	for turn := 1; turn <= 4; turn++ {
+		msgs += fmt.Sprintf(`,{"role":"user","content":"question %d"},{"role":"assistant","content":"answer %d"}`, turn, turn)
+		resp := post(t, router.URL, `{"messages":[`+msgs+`]}`)
+		resp.Body.Close()
+		got := resp.Header.Get("X-Routed-To")
+		if turn == 1 {
+			first = got
+		} else if got != first {
+			t.Fatalf("turn %d routed to %s, want %s", turn, got, first)
+		}
+	}
+}
+
 // The in-flight count must cover the whole stream and drop back to zero
 // when it ends, including when the client disconnects mid-stream.
 func TestInflightCoversStreamAndReleases(t *testing.T) {

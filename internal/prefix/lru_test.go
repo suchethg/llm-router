@@ -34,6 +34,24 @@ func TestLRUEvictsLeastRecentlyUsed(t *testing.T) {
 	}
 }
 
+func TestLRUMatchIsReadOnly(t *testing.T) {
+	c := NewLRU(2)
+	c.MatchAndInsert([]uint64{1})
+	c.MatchAndInsert([]uint64{2})
+	if n := c.Match([]uint64{1, 2, 3}); n != 2 {
+		t.Fatalf("Match = %d, want 2", n)
+	}
+	if cached(c, 3) {
+		t.Fatal("Match must not insert")
+	}
+	// If Match([1]) refreshed 1, inserting 4 would evict 2 instead of 1.
+	c.Match([]uint64{1})
+	c.MatchAndInsert([]uint64{4})
+	if cached(c, 1) || !cached(c, 2) {
+		t.Fatal("Match must not change recency")
+	}
+}
+
 // cached reports whether h is present without changing its recency.
 func cached(c *LRU, h uint64) bool {
 	c.mu.Lock()
