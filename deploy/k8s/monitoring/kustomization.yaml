@@ -1,0 +1,14 @@
+# Grafana dashboards as ConfigMaps. The Grafana chart's sidecar loads every
+# ConfigMap labelled grafana_dashboard=1 in its namespace.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: monitoring
+configMapGenerator:
+  - name: grafana-dashboards
+    files:
+      - dashboards/llm-router.json
+    options:
+      labels:
+        grafana_dashboard: "1"
+      # A stable name; Grafana's sidecar picks up changes by watching.
+      disableNameSuffixHash: true

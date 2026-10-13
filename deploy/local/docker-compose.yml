@@ -18,5 +18,6 @@ services:
       GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/llm-router.json
     volumes:
       - ./grafana/provisioning:/etc/grafana/provisioning:ro
-      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      # Same dashboard file the Kubernetes setup uses (deploy/k8s/monitoring).
+      - ../k8s/monitoring/dashboards:/var/lib/grafana/dashboards:ro
     depends_on: [prometheus]

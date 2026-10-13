@@ -1,0 +1,40 @@
+# Grafana with Prometheus as its data source and the dashboards ConfigMaps
+# (see dashboards.yaml) loaded by its sidecar.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: grafana
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://grafana-community.github.io/helm-charts # moved from grafana/helm-charts in 2026
+    chart: grafana
+    targetRevision: 13.5.0 # Grafana 13.2.3
+    helm:
+      valuesObject:
+        resources: {requests: {cpu: 50m, memory: 128Mi}}
+        datasources:
+          datasources.yaml:
+            apiVersion: 1
+            datasources:
+              - name: Prometheus
+                uid: prometheus # the dashboard JSON refers to this uid
+                type: prometheus
+                url: http://prometheus-server.monitoring.svc
+                isDefault: true
+        sidecar:
+          dashboards:
+            enabled: true
+            label: grafana_dashboard
+            labelValue: "1"
+        grafana.ini:
+          # Local only: view without logging in.
+          auth.anonymous: {enabled: true, org_role: Viewer}
+          dashboards: {default_home_dashboard_path: /tmp/dashboards/llm-router.json}
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: monitoring
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
+    syncOptions: [CreateNamespace=true]

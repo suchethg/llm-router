@@ -1,0 +1,18 @@
+# The router, pointed at vllm-metal replicas on the host (start them with
+# `make run-vllm-mac`). For NVIDIA nodes, change the path to overlays/gpu.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: llm-router
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/suchethg/llm-router.git
+    targetRevision: main
+    path: deploy/k8s/overlays/mac-gpu
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: llm-router
+  syncPolicy:
+    automated: {prune: true, selfHeal: true}
