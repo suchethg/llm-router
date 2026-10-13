@@ -3,16 +3,20 @@ package main
 import (
 	"bufio"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/suchethg/llm-router/internal/prefix"
 )
 
 func testConfig() config {
-	return config{name: "t", model: "m", maxSeqs: 4, defaultMaxToks: 3}
+	return config{name: "t", model: "m", maxSeqs: 4, blockChars: 64, cacheBlocks: 100, defaultMaxToks: 3}
 }
 
 func post(t *testing.T, url, body string) *http.Response {
@@ -33,7 +37,7 @@ func TestNonStreaming(t *testing.T) {
 	var out struct {
 		Object  string `json:"object"`
 		Choices []struct {
-			Message message `json:"message"`
+			Message prefix.Message `json:"message"`
 		} `json:"choices"`
 		Usage struct {
 			PromptTokens     int `json:"prompt_tokens"`
@@ -46,8 +50,8 @@ func TestNonStreaming(t *testing.T) {
 	if out.Object != "chat.completion" || len(out.Choices) != 1 || out.Choices[0].Message.Role != "assistant" {
 		t.Fatalf("bad response: %+v", out)
 	}
-	// "user" + 16 chars = 20 chars = 5 tokens.
-	if out.Usage.PromptTokens != 5 || out.Usage.CompletionTokens != 5 {
+	// Rendered "<|user|>0123456789abcdef\n" is 25 chars = 6 tokens.
+	if out.Usage.PromptTokens != 6 || out.Usage.CompletionTokens != 5 {
 		t.Fatalf("usage = %+v", out.Usage)
 	}
 	if resp.Header.Get("X-Replica") != "t" {
@@ -156,5 +160,74 @@ func TestModels(t *testing.T) {
 	json.NewDecoder(resp.Body).Decode(&out)
 	if len(out.Data) != 1 || out.Data[0].ID != "m" {
 		t.Fatalf("models = %+v", out)
+	}
+}
+
+func chatBody(msgs []prefix.Message, stream bool) string {
+	b, _ := json.Marshal(map[string]any{"messages": msgs, "stream": stream, "max_tokens": 1})
+	return string(b)
+}
+
+// A follow-up turn resends the first turn as its prefix, so it should hit
+// the cache for all of turn 1's full blocks and prefill much faster.
+func TestFollowUpTurnHitsCache(t *testing.T) {
+	c := testConfig()
+	c.prefillPerTok = time.Millisecond
+	srv := httptest.NewServer(newServer(c))
+	defer srv.Close()
+
+	turn1 := []prefix.Message{{Role: "system", Content: strings.Repeat("s", 600)}, {Role: "user", Content: "q1"}}
+	turn2 := append(append([]prefix.Message{}, turn1...),
+		prefix.Message{Role: "assistant", Content: "a1"}, prefix.Message{Role: "user", Content: "q2"})
+
+	send := func(msgs []prefix.Message) (time.Duration, string) {
+		start := time.Now()
+		resp := post(t, srv.URL, chatBody(msgs, false))
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+		return time.Since(start), resp.Header.Get("X-Prefix-Hit-Blocks")
+	}
+	d1, hits1 := send(turn1)
+	d2, hits2 := send(turn2)
+
+	wantHits := fmt.Sprint(len(prefix.BlockHashes(prefix.RenderChat(turn1), 64)))
+	if hits1 != "0" || hits2 != wantHits {
+		t.Fatalf("hit blocks: turn1=%s turn2=%s, want 0 and %s", hits1, hits2, wantHits)
+	}
+	// ~154 uncached tokens (~154ms) vs ~10 uncached tokens (~10ms).
+	if d2 > d1/3 {
+		t.Fatalf("turn2 took %v vs turn1 %v; cached prefix should make it much faster", d2, d1)
+	}
+}
+
+func TestMetricsCountTokens(t *testing.T) {
+	srv := httptest.NewServer(newServer(testConfig()))
+	defer srv.Close()
+
+	// Rendered prompt: 8 + 1000 + 1 = 1009 chars = 252 tokens, 15 full
+	// blocks of 64 chars = 240 cacheable tokens.
+	body := chatBody([]prefix.Message{{Role: "user", Content: strings.Repeat("y", 1000)}}, false)
+	for i := 0; i < 2; i++ {
+		resp := post(t, srv.URL, body)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+
+	resp, err := http.Get(srv.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	text, _ := io.ReadAll(resp.Body)
+	for _, want := range []string{
+		`vllm:prefix_cache_queries_total{model_name="m"} 504`, // 2 x 252
+		`vllm:prefix_cache_hits_total{model_name="m"} 240`,    // second request only
+		`vllm:kv_cache_usage_perc{model_name="m"} 0.15`,       // 15 of 100 blocks
+		`vllm:num_requests_running{model_name="m"} 0`,
+		`vllm:num_requests_waiting{model_name="m"} 0`,
+	} {
+		if !strings.Contains(string(text), want+"\n") {
+			t.Errorf("metrics missing %q", want)
+		}
 	}
 }
