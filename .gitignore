@@ -1,2 +1,7 @@
 bin/
 bench-results/
+
+# Terraform: local state and provider cache (the lock file is committed)
+.terraform/
+*.tfstate
+*.tfstate.*

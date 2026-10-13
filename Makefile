@@ -1,4 +1,4 @@
-.PHONY: build test run-mocks run-router stop bench monitoring-up monitoring-down images kind-up kind-down run-vllm-mac
+.PHONY: build test run-mocks run-router stop bench monitoring-up monitoring-down images kind-up kind-down run-vllm-mac tf-up tf-down
 
 build:
 	go build -o bin/ ./cmd/...
@@ -60,3 +60,16 @@ kind-down:
 # vLLM replicas on the Mac GPU (vllm-metal), ports 8001-8002. `make stop` ends them.
 run-vllm-mac:
 	scripts/vllm-mac.sh 2
+
+# On-prem via Terraform: kind cluster + Argo CD + root Application, then the
+# locally built images (Terraform doesn't build images). Argo CD deploys the
+# rest from git. Separate from kind-up: both use the cluster name llm-router.
+TF = terraform -chdir=deploy/terraform/onprem
+
+tf-up: images
+	$(TF) init -input=false
+	$(TF) apply -input=false
+	kind load docker-image --name llm-router llm-router/router:dev llm-router/mockvllm:dev
+
+tf-down:
+	$(TF) destroy -input=false
