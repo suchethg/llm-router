@@ -94,6 +94,21 @@ replicas on an 18 GB Mac (each replica uses about 3.7 GB). Set
 `-cache-blocks` to the replica's KV cache size in tokens ÷ 16; vLLM logs it
 at startup as `KV cache size: N tokens`.
 
+### Monitoring
+
+The router exports Prometheus metrics on `/metrics`. To see them with the
+replicas' vLLM metrics in Grafana (requires Docker):
+
+```sh
+make monitoring-up     # Grafana http://localhost:3000, Prometheus http://localhost:9090
+make monitoring-down
+```
+
+The `llm-router` dashboard opens without a login. It shows requests per
+replica, routing reasons, the router's predicted prefix-cache hit rate next to
+vLLM's actual one, time to first token, per-replica load and KV cache usage,
+and the router's own overhead.
+
 ### Router flags
 
 | Flag | Default | Meaning |
