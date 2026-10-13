@@ -1,0 +1,14 @@
+# GKE with an L4 GPU node pool: 4 real vLLM replicas of Llama-3.1-8B-Instruct.
+# Before applying, create the Hugging Face token secret (the model is gated):
+#   kubectl -n llm-router create secret generic hf-token --from-literal=token=hf_...
+# and push the router image to a registry the cluster can pull from, then
+# set its name below.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - vllm-replicas.yaml
+images:
+  - name: llm-router/router
+    newName: REGISTRY/llm-router/router # set when the registry exists (roadmap: Terraform)
+    newTag: dev

@@ -1,0 +1,14 @@
+# Headless (clusterIP: None): no load balancing. Each StatefulSet pod gets
+# its own DNS name, vllm-0.vllm, vllm-1.vllm, ..., which the router needs in
+# order to send each request to one specific replica.
+apiVersion: v1
+kind: Service
+metadata:
+  name: vllm
+spec:
+  clusterIP: None
+  selector:
+    app: vllm
+  ports:
+    - name: http
+      port: 8000

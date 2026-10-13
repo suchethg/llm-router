@@ -1,0 +1,10 @@
+# Shared by every environment: the namespace, the router, and the headless
+# Service that gives each inference replica a stable DNS name. The replicas
+# themselves (mock or real vLLM) come from the overlays.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: llm-router
+resources:
+  - namespace.yaml
+  - router.yaml
+  - replicas-service.yaml

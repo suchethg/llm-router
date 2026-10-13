@@ -1,0 +1,6 @@
+# Local kind cluster: 4 mock replicas, no GPU (Docker on a Mac can't use Metal).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - mock-replicas.yaml

@@ -1,0 +1,6 @@
+.git
+bin
+bench-results
+deploy
+scripts
+*.md

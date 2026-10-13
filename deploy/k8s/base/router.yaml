@@ -1,0 +1,58 @@
+# One router replica on purpose: each copy keeps its own shadow index and
+# in-flight counts, so N copies would each see 1/N of the traffic and
+# predict cache contents worse. Scaling the router is a separate design.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: llm-router
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: llm-router
+  template:
+    metadata:
+      labels:
+        app: llm-router
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8090"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+      containers:
+        - name: router
+          image: llm-router/router:dev
+          args:
+            - -addr=:8090
+            - -policy=prefix-aware
+            # Must list every StatefulSet pod; keep in step with its replicas.
+            - -backends=http://vllm-0.vllm:8000,http://vllm-1.vllm:8000,http://vllm-2.vllm:8000,http://vllm-3.vllm:8000
+          ports:
+            - name: http
+              containerPort: 8090
+          readinessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /healthz, port: http}
+            periodSeconds: 10
+          resources:
+            requests: {cpu: 100m, memory: 64Mi}
+            limits: {memory: 256Mi}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: {drop: [ALL]}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: llm-router
+spec:
+  selector:
+    app: llm-router
+  ports:
+    - name: http
+      port: 8090
+      targetPort: http

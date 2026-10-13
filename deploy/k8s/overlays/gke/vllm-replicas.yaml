@@ -1,0 +1,76 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: vllm
+  namespace: llm-router
+spec:
+  serviceName: vllm
+  replicas: 4
+  podManagementPolicy: Parallel
+  selector:
+    matchLabels:
+      app: vllm
+  template:
+    metadata:
+      labels:
+        app: vllm
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+    spec:
+      nodeSelector:
+        cloud.google.com/gke-accelerator: nvidia-l4
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: vllm
+          image: vllm/vllm-openai:v0.30.0
+          args:
+            - --model=meta-llama/Llama-3.1-8B-Instruct
+            - --port=8000
+            - --enable-prefix-caching
+            - --gpu-memory-utilization=0.90
+            - --max-model-len=8192
+          env:
+            - name: HF_TOKEN
+              valueFrom: {secretKeyRef: {name: hf-token, key: token}}
+            - name: HF_HOME
+              value: /models
+          ports:
+            - name: http
+              containerPort: 8000
+          # Loading 8B weights takes minutes, longer on a cold download:
+          # allow up to 15 minutes before liveness checks begin.
+          startupProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 5
+          livenessProbe:
+            httpGet: {path: /health, port: http}
+            periodSeconds: 15
+          resources:
+            # One L4 per replica; fits a g2-standard-8 node (8 vCPU, 32 GB).
+            requests: {cpu: "6", memory: 24Gi, nvidia.com/gpu: "1"}
+            limits: {memory: 28Gi, nvidia.com/gpu: "1"}
+          volumeMounts:
+            - {name: models, mountPath: /models}
+            - {name: shm, mountPath: /dev/shm}
+      volumes:
+        # vLLM uses shared memory between its processes; the container
+        # default (64 MB) is too small.
+        - name: shm
+          emptyDir: {medium: Memory, sizeLimit: 2Gi}
+  # Keep downloaded weights (~16 GB) across pod restarts.
+  volumeClaimTemplates:
+    - metadata:
+        name: models
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 50Gi
