@@ -11,7 +11,9 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"time"
 
+	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/suchethg/llm-router/internal/backend"
 	"github.com/suchethg/llm-router/internal/policy"
 	"github.com/suchethg/llm-router/internal/prefix"
@@ -52,8 +54,10 @@ func main() {
 }
 
 func newHandler(bs []*backend.Backend, pol policy.Policy) http.Handler {
+	m := newMetrics(bs)
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
+		arrived := time.Now()
 		body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
 		if err != nil {
 			status := http.StatusBadRequest
@@ -74,14 +78,20 @@ func newHandler(bs []*backend.Backend, pol policy.Policy) http.Handler {
 		// The proxy forwards r.Body, which we just consumed: put it back.
 		r.Body = io.NopCloser(bytes.NewReader(body))
 
-		b := pol.Pick(&policy.Request{Prompt: prefix.RenderChat(chat.Messages)}, bs)
+		d := pol.Pick(&policy.Request{Prompt: prefix.RenderChat(chat.Messages)}, bs)
+		b := d.Backend
 		// Held until ServeHTTP returns, i.e. the whole response has streamed
 		// or the client has gone away, so decode time counts as load.
 		b.Acquire()
 		defer b.Release()
+		m.routingLatency.Observe(time.Since(arrived).Seconds())
+
 		w.Header().Set("X-Routed-To", b.Name)
-		b.Proxy.ServeHTTP(w, r)
+		rec := &recorder{ResponseWriter: w}
+		b.Proxy.ServeHTTP(rec, r)
+		m.observe(pol.Name(), d, rec, arrived)
 	})
+	mux.Handle("GET /metrics", promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{}))
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	})

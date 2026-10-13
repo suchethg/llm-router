@@ -27,7 +27,7 @@ func TestRoundRobinCycles(t *testing.T) {
 	bs := backends(t, 3)
 	p := &RoundRobin{}
 	for i := 0; i < 7; i++ {
-		if got, want := p.Pick(nil, bs), bs[i%3]; got != want {
+		if got, want := p.Pick(nil, bs).Backend, bs[i%3]; got != want {
 			t.Fatalf("pick %d = %s, want %s", i, got.Name, want.Name)
 		}
 	}
@@ -46,7 +46,7 @@ func TestRoundRobinConcurrentEven(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < 500; i++ {
-				b := p.Pick(nil, bs)
+				b := p.Pick(nil, bs).Backend
 				mu.Lock()
 				counts[b]++
 				mu.Unlock()
@@ -66,7 +66,7 @@ func TestLeastLoadPicksIdlest(t *testing.T) {
 	bs[0].Acquire()
 	bs[0].Acquire()
 	bs[2].Acquire()
-	if got := (&LeastLoad{}).Pick(nil, bs); got != bs[1] {
+	if got := (&LeastLoad{}).Pick(nil, bs).Backend; got != bs[1] {
 		t.Fatalf("picked %s (inflight %d), want idle %s", got.Name, got.Inflight(), bs[1].Name)
 	}
 }
@@ -77,7 +77,7 @@ func TestLeastLoadSpreadsAsLoadBuilds(t *testing.T) {
 	bs := backends(t, 3)
 	p := &LeastLoad{}
 	for i := 0; i < 6; i++ {
-		b := p.Pick(nil, bs)
+		b := p.Pick(nil, bs).Backend
 		if want := bs[i%3]; b != want {
 			t.Fatalf("pick %d = %s, want %s", i, b.Name, want.Name)
 		}
@@ -115,9 +115,9 @@ var sysA = strings.Repeat("You are a support agent. ", 40) // ~1000 chars, 15 bl
 func TestPrefixAwareKeepsConversationOnOneReplica(t *testing.T) {
 	bs := backends(t, 4)
 	p := NewPrefixAware(DefaultOptions())
-	first := p.Pick(conversation(sysA, "alice", 1), bs)
+	first := p.Pick(conversation(sysA, "alice", 1), bs).Backend
 	for turn := 2; turn <= 6; turn++ {
-		if got := p.Pick(conversation(sysA, "alice", turn), bs); got != first {
+		if got := p.Pick(conversation(sysA, "alice", turn), bs).Backend; got != first {
 			t.Fatalf("turn %d went to %s, want %s", turn, got.Name, first.Name)
 		}
 	}
@@ -130,7 +130,7 @@ func TestPrefixAwareSpreadsUnrelatedConversations(t *testing.T) {
 	p := NewPrefixAware(DefaultOptions())
 	seen := map[*backend.Backend]bool{}
 	for i := 0; i < 4; i++ {
-		b := p.Pick(conversation(fmt.Sprintf("system prompt %d ", i)+sysA, "u", 1), bs)
+		b := p.Pick(conversation(fmt.Sprintf("system prompt %d ", i)+sysA, "u", 1), bs).Backend
 		b.Acquire()
 		seen[b] = true
 	}
@@ -144,9 +144,9 @@ func TestPrefixAwareSpreadsUnrelatedConversations(t *testing.T) {
 func TestPrefixAwareReusesSharedSystemPrompt(t *testing.T) {
 	bs := backends(t, 4)
 	p := NewPrefixAware(DefaultOptions())
-	home := p.Pick(conversation(sysA, "alice", 1), bs)
+	home := p.Pick(conversation(sysA, "alice", 1), bs).Backend
 	home.Acquire() // alice still in flight: home is busier than the rest
-	if got := p.Pick(conversation(sysA, "bob", 1), bs); got != home {
+	if got := p.Pick(conversation(sysA, "bob", 1), bs).Backend; got != home {
 		t.Fatalf("bob went to %s, want %s where the system prompt is cached", got.Name, home.Name)
 	}
 }
@@ -157,15 +157,15 @@ func TestPrefixAwareLoadSlackOverridesCache(t *testing.T) {
 	opts.LoadSlack = 2
 	p := NewPrefixAware(opts)
 
-	home := p.Pick(conversation(sysA, "alice", 1), bs)
+	home := p.Pick(conversation(sysA, "alice", 1), bs).Backend
 	for i := 0; i < 2; i++ {
 		home.Acquire()
 	}
-	if got := p.Pick(conversation(sysA, "alice", 2), bs); got != home {
+	if got := p.Pick(conversation(sysA, "alice", 2), bs).Backend; got != home {
 		t.Fatalf("at slack (2 extra) the cache should still win, went to %s", got.Name)
 	}
 	home.Acquire() // now 3 more than the idle replica
-	if got := p.Pick(conversation(sysA, "alice", 3), bs); got == home {
+	if got := p.Pick(conversation(sysA, "alice", 3), bs).Backend; got == home {
 		t.Fatalf("beyond slack, picked overloaded %s (inflight %d)", home.Name, home.Inflight())
 	}
 }
@@ -175,7 +175,7 @@ func TestPrefixAwareTieGoesToLowerLoad(t *testing.T) {
 	bs[0].Acquire()
 	bs[2].Acquire()
 	p := NewPrefixAware(DefaultOptions())
-	if got := p.Pick(conversation(sysA, "alice", 1), bs); got != bs[1] {
+	if got := p.Pick(conversation(sysA, "alice", 1), bs).Backend; got != bs[1] {
 		t.Fatalf("no overlap anywhere: picked %s, want idle %s", got.Name, bs[1].Name)
 	}
 }
@@ -190,11 +190,47 @@ func TestPrefixAwareConcurrent(t *testing.T) {
 		go func(g int) {
 			defer wg.Done()
 			for turn := 1; turn <= 20; turn++ {
-				b := p.Pick(conversation(sysA, fmt.Sprint("user", g), turn), bs)
+				b := p.Pick(conversation(sysA, fmt.Sprint("user", g), turn), bs).Backend
 				b.Acquire()
 				b.Release()
 			}
 		}(g)
 	}
 	wg.Wait()
+}
+
+func TestPrefixAwareDecisionReasons(t *testing.T) {
+	bs := backends(t, 2)
+	opts := DefaultOptions()
+	opts.LoadSlack = 1
+	p := NewPrefixAware(opts)
+
+	d := p.Pick(conversation(sysA, "alice", 1), bs)
+	if d.Reason != ReasonNoOverlap || d.MatchedBlocks != 0 || d.PromptBlocks == 0 {
+		t.Fatalf("first turn: %+v, want no_overlap with 0 matched", d)
+	}
+	home := d.Backend
+	turn1Blocks := d.PromptBlocks
+
+	d = p.Pick(conversation(sysA, "alice", 2), bs)
+	if d.Reason != ReasonCacheHit || d.Backend != home || d.MatchedBlocks != turn1Blocks {
+		t.Fatalf("second turn: %+v, want cache_hit on %s matching %d blocks", d, home.Name, turn1Blocks)
+	}
+
+	home.Acquire()
+	home.Acquire() // 2 more than the idle replica, beyond slack 1
+	d = p.Pick(conversation(sysA, "alice", 3), bs)
+	if d.Reason != ReasonLoadOverride || d.Backend == home || d.MatchedBlocks != 0 {
+		t.Fatalf("overloaded home: %+v, want load_override elsewhere with 0 matched", d)
+	}
+}
+
+func TestBaselineReasons(t *testing.T) {
+	bs := backends(t, 2)
+	if r := (&RoundRobin{}).Pick(nil, bs).Reason; r != ReasonRoundRobin {
+		t.Errorf("round-robin reason %q", r)
+	}
+	if r := (&LeastLoad{}).Pick(nil, bs).Reason; r != ReasonLeastLoad {
+		t.Errorf("least-load reason %q", r)
+	}
 }

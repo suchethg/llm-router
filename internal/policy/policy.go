@@ -16,11 +16,28 @@ type Request struct {
 	Prompt string // chat messages rendered with prefix.RenderChat
 }
 
+// Reasons a policy gives for its choice, used as a metric label.
+const (
+	ReasonRoundRobin   = "round-robin"
+	ReasonLeastLoad    = "least-load"
+	ReasonCacheHit     = "cache_hit"     // longest cached prefix among eligible replicas
+	ReasonNoOverlap    = "no_overlap"    // nothing cached anywhere: fell back to least-load
+	ReasonLoadOverride = "load_override" // a longer prefix was cached on a replica over the slack
+)
+
+// Decision is a policy's choice plus what the router reports about it.
+type Decision struct {
+	Backend       *backend.Backend
+	PromptBlocks  int // full blocks in the prompt
+	MatchedBlocks int // blocks predicted to be cached on Backend
+	Reason        string
+}
+
 // Policy picks a backend for a request. Pick is called concurrently from
 // every in-flight request, so implementations must be safe for that.
 type Policy interface {
 	Name() string
-	Pick(req *Request, backends []*backend.Backend) *backend.Backend
+	Pick(req *Request, backends []*backend.Backend) Decision
 }
 
 // Options tunes the prefix-aware policy; the baselines ignore it.
@@ -54,9 +71,9 @@ type RoundRobin struct{ next atomic.Uint64 }
 
 func (*RoundRobin) Name() string { return "round-robin" }
 
-func (p *RoundRobin) Pick(_ *Request, bs []*backend.Backend) *backend.Backend {
+func (p *RoundRobin) Pick(_ *Request, bs []*backend.Backend) Decision {
 	n := p.next.Add(1) - 1
-	return bs[n%uint64(len(bs))]
+	return Decision{Backend: bs[n%uint64(len(bs))], Reason: ReasonRoundRobin}
 }
 
 // LeastLoad picks the backend with the fewest in-flight requests, ties going
@@ -71,14 +88,14 @@ type LeastLoad struct{}
 
 func (*LeastLoad) Name() string { return "least-load" }
 
-func (*LeastLoad) Pick(_ *Request, bs []*backend.Backend) *backend.Backend {
+func (*LeastLoad) Pick(_ *Request, bs []*backend.Backend) Decision {
 	best := bs[0]
 	for _, b := range bs[1:] {
 		if b.Inflight() < best.Inflight() {
 			best = b
 		}
 	}
-	return best
+	return Decision{Backend: best, Reason: ReasonLeastLoad}
 }
 
 // PrefixAware routes each request to the replica most likely to have its
@@ -107,7 +124,7 @@ func NewPrefixAware(opts Options) *PrefixAware {
 
 func (*PrefixAware) Name() string { return "prefix-aware" }
 
-func (p *PrefixAware) Pick(req *Request, bs []*backend.Backend) *backend.Backend {
+func (p *PrefixAware) Pick(req *Request, bs []*backend.Backend) Decision {
 	hashes := prefix.BlockHashes(req.Prompt, p.opts.BlockChars) // outside the lock
 
 	p.mu.Lock()
@@ -122,18 +139,27 @@ func (p *PrefixAware) Pick(req *Request, bs []*backend.Backend) *backend.Backend
 	}
 	minLoad := slices.Min(loads)
 
-	best, bestMatch := -1, -1
+	best, bestMatch, longestAnywhere := -1, -1, 0
 	for i, b := range bs {
+		m := p.shadowOf(b).Match(hashes)
+		longestAnywhere = max(longestAnywhere, m)
 		if loads[i] > minLoad+p.opts.LoadSlack {
 			continue
 		}
-		m := p.shadowOf(b).Match(hashes)
 		if m > bestMatch || (m == bestMatch && loads[i] < loads[best]) {
 			best, bestMatch = i, m
 		}
 	}
 	p.shadowOf(bs[best]).MatchAndInsert(hashes)
-	return bs[best]
+
+	d := Decision{Backend: bs[best], PromptBlocks: len(hashes), MatchedBlocks: bestMatch, Reason: ReasonCacheHit}
+	switch {
+	case longestAnywhere > bestMatch:
+		d.Reason = ReasonLoadOverride
+	case bestMatch == 0:
+		d.Reason = ReasonNoOverlap
+	}
+	return d
 }
 
 // shadowOf must be called with p.mu held.

@@ -12,6 +12,7 @@ import (
 
 	"github.com/suchethg/llm-router/internal/backend"
 	"github.com/suchethg/llm-router/internal/policy"
+	"github.com/suchethg/llm-router/internal/prefix"
 )
 
 func TestForwardsChat(t *testing.T) {
@@ -246,4 +247,72 @@ func parse(t *testing.T, urls ...string) []*backend.Backend {
 func newRouter(t *testing.T, urls ...string) http.Handler {
 	t.Helper()
 	return newHandler(parse(t, urls...), &policy.RoundRobin{})
+}
+
+// Two turns of one conversation through prefix-aware routing, then a scrape:
+// the first turn is no_overlap, the second a cache_hit on the same replica
+// with turn 1's blocks predicted cached, and nothing is left in flight.
+func TestMetrics(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "ok")
+	}))
+	defer upstream.Close()
+	bs := parse(t, upstream.URL)
+	router := httptest.NewServer(newHandler(bs, policy.NewPrefixAware(policy.DefaultOptions())))
+	defer router.Close()
+
+	msgs := `{"role":"system","content":"` + strings.Repeat("You are a support agent. ", 40) + `"},{"role":"user","content":"q1"}`
+	for _, body := range []string{
+		`{"messages":[` + msgs + `]}`,
+		`{"messages":[` + msgs + `,{"role":"assistant","content":"a1"},{"role":"user","content":"q2"}]}`,
+	} {
+		resp := post(t, router.URL, body)
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+	}
+
+	resp, err := http.Get(router.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	text, _ := io.ReadAll(resp.Body)
+	name := bs[0].Name
+	turn1 := len(prefix.BlockHashes(prefix.RenderChat([]prefix.Message{
+		{Role: "system", Content: strings.Repeat("You are a support agent. ", 40)}, {Role: "user", Content: "q1"},
+	}), prefix.DefaultBlockChars))
+	for _, want := range []string{
+		fmt.Sprintf(`router_requests_total{backend=%q,code="200",policy="prefix-aware",reason="no_overlap"} 1`, name),
+		fmt.Sprintf(`router_requests_total{backend=%q,code="200",policy="prefix-aware",reason="cache_hit"} 1`, name),
+		fmt.Sprintf(`router_predicted_hit_blocks_total{backend=%q} %d`, name, turn1),
+		fmt.Sprintf(`router_inflight_requests{backend=%q} 0`, name),
+		fmt.Sprintf(`router_time_to_first_byte_seconds_count{backend=%q} 2`, name),
+		`router_routing_overhead_seconds_count 2`,
+	} {
+		if !strings.Contains(string(text), want+"\n") {
+			t.Errorf("metrics missing %q", want)
+		}
+	}
+}
+
+// Failed upstream requests are counted by status code but kept out of the
+// latency histograms.
+func TestMetricsCountErrors(t *testing.T) {
+	bs := parse(t, "http://127.0.0.1:1") // nothing listens: the proxy returns 502
+	router := httptest.NewServer(newHandler(bs, &policy.RoundRobin{}))
+	defer router.Close()
+	post(t, router.URL, `{}`).Body.Close()
+
+	resp, err := http.Get(router.URL + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	text, _ := io.ReadAll(resp.Body)
+	if want := `router_requests_total{backend="127.0.0.1:1",code="502",policy="round-robin",reason="round-robin"} 1`; !strings.Contains(string(text), want) {
+		t.Errorf("missing %q", want)
+	}
+	if strings.Contains(string(text), "router_time_to_first_byte_seconds_count") {
+		t.Error("a 502 should not be observed as a time to first byte")
+	}
 }
