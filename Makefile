@@ -1,4 +1,4 @@
-.PHONY: build test run-mocks run-router stop
+.PHONY: build test run-mocks run-router stop bench
 
 build:
 	go build -o bin/ ./cmd/...
@@ -18,3 +18,7 @@ run-router: build
 stop:
 	-pkill -f bin/mockvllm
 	-pkill -f bin/router
+
+# Compare all policies on the same multi-turn workload (fresh mocks each).
+bench:
+	scripts/bench.sh
