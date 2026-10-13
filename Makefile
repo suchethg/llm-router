@@ -1,4 +1,4 @@
-.PHONY: build test run-mocks run-router stop bench
+.PHONY: build test run-mocks run-router stop bench monitoring-up monitoring-down
 
 build:
 	go build -o bin/ ./cmd/...
@@ -22,3 +22,10 @@ stop:
 # Compare all policies on the same multi-turn workload (fresh mocks each).
 bench:
 	scripts/bench.sh
+
+# Prometheus (:9090) and Grafana (:3000) in Docker, scraping the host.
+monitoring-up:
+	docker compose -f deploy/local/docker-compose.yml up -d
+
+monitoring-down:
+	docker compose -f deploy/local/docker-compose.yml down

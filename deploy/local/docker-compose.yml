@@ -1,0 +1,22 @@
+# Local monitoring for the router and its replicas, which run on the host.
+#   make monitoring-up    Grafana: http://localhost:3000  Prometheus: http://localhost:9090
+#   make monitoring-down
+services:
+  prometheus:
+    image: prom/prometheus:v3.1.0
+    ports: ["127.0.0.1:9090:9090"]
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.4.0
+    ports: ["127.0.0.1:3000:3000"]
+    environment:
+      # Local only: open without logging in (admin/admin still works).
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/llm-router.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on: [prometheus]
