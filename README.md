@@ -9,35 +9,148 @@ conversation's turns across replicas, so most turns pay full prefill again.
 This router sends each request to the replica most likely to have its prompt
 prefix cached, as long as that replica isn't overloaded.
 
-## How it works
+## Design
+
+### Architecture
 
 ```
-client ──► router ──► replica 1 (vLLM)
-             │   ├──► replica 2
-             │   └──► ...
-             └─ per replica: shadow index of KV blocks sent there + in-flight count
+                          ┌──────────────────────────── router ────────────────────────────┐
+                          │                                                                │
+ client ── POST /v1/chat/ │  read body ─► render chat ─► policy.Pick ─► reverse proxy ─────┼──► replica 1 (vLLM)
+           completions ──►│  (≤ 8 MiB)    + hash blocks    │              (streams SSE)    ├──► replica 2
+                          │                                ▼                               ├──► ...
+                          │              per replica: shadow LRU of block hashes,          │
+                          │                           in-flight request count              │
+                          │                                                                │
+                          │  GET /metrics ◄── Prometheus ──► each replica's /metrics       │
+                          └────────────────────────────────────────────────────────────────┘
 ```
 
-1. **Prefix keys like vLLM's.** The prompt is split into fixed-size blocks, and
-   each block is keyed by a hash chained over every block before it, the same
-   scheme vLLM uses for automatic prefix caching. Block *i* is only reusable
-   when the whole prompt up to block *i* matches (`internal/prefix`).
-2. **Shadow index.** The router can't see replica caches, so it keeps an LRU
-   per replica of the block hashes it has sent there, sized like the replica's
-   real KV cache.
-3. **Routing rule** (`internal/policy`, `prefix-aware`): only replicas within
-   `-load-slack` in-flight requests of the least-loaded one are eligible.
-   Among those, pick the one with the longest cached prefix; ties go to lower
-   load. With no overlap anywhere, this falls back to least-load, which
-   spreads out new conversations.
-4. **Load** is the router's own count of in-flight requests (held until the
-   response finishes streaming), not vLLM's scraped metrics, which are
-   seconds stale and cause herding.
+The router is a single Go binary with no external state. It speaks the
+OpenAI chat completions API on both sides, so clients and vLLM replicas need
+no changes.
 
-The router has no tokenizer, so blocks are measured in characters (64 chars ≈
-16 tokens). Its estimate of what a replica has cached is approximate. It only
-needs to rank replicas correctly; reported hit rates always come from vLLM's
-own metrics.
+### Request lifecycle
+
+1. **Read** the body (up to 8 MiB; larger is rejected with 413) and parse the
+   `messages`. A body that can't be parsed is still forwarded unchanged and
+   routed on load alone, so vLLM returns its own error for it.
+2. **Render and hash.** The messages are flattened into one string and split
+   into fixed-size blocks, each with a chained hash (below).
+3. **Pick** a replica with the configured policy. The policy returns the
+   replica plus why it chose it and how many blocks it expects to be cached.
+4. **Count load.** The replica's in-flight counter goes up before proxying
+   and down only when the response has finished streaming (or the client has
+   gone away), so decode time counts as load.
+5. **Proxy** with Go's reverse proxy, which flushes each server-sent event as
+   it arrives, so tokens stream through without buffering. The response
+   carries an `X-Routed-To` header naming the replica.
+6. **Record metrics:** routing reason, predicted cache hits, status code,
+   time to first byte and total duration.
+
+### Prefix keys
+
+vLLM's automatic prefix caching splits a prompt into fixed-size blocks and
+keys each block by a hash chained over all blocks before it:
+
+```
+key(block i) = hash(key(block i-1) ‖ text of block i)
+```
+
+So one key stands for the entire prompt up to that block: block *i* is only
+reusable if everything before it matches too. Multi-turn chat fits this
+exactly, since every turn resends the earlier turns unchanged as a prefix.
+The router computes the same kind of keys (`internal/prefix`). It has no
+tokenizer, so blocks are 64 characters (about vLLM's 16 tokens), and a final
+partial block is dropped, as vLLM only caches full blocks.
+
+### Shadow index
+
+The router can't see inside the replicas' KV caches, so for each replica it
+keeps an LRU set of the block keys it has sent there, sized like that
+replica's real cache (`-cache-blocks`). It is an estimate: it can drift if a
+replica restarts or evicts differently, and corrects itself as traffic is
+recorded. The router only needs it to *rank* replicas; hit rates are always
+reported from vLLM's own metrics, and the Grafana dashboard plots the
+router's predicted hit rate next to vLLM's actual one so drift is visible.
+
+### Routing policies
+
+| Policy | Rule | Role |
+|---|---|---|
+| `round-robin` | Next replica in turn | Baseline: ignores load and content |
+| `least-load` | Fewest in-flight requests | Baseline: load-aware, cache-blind |
+| `prefix-aware` | Longest cached prefix among replicas that aren't overloaded | The router's policy |
+
+`prefix-aware`, step by step:
+
+```
+loads    = in-flight count of every replica (one snapshot)
+eligible = replicas with load <= min(loads) + load_slack
+choice   = eligible replica with the longest cached prefix in its shadow index,
+           ties going to the lower load
+record the prompt's blocks in choice's shadow index
+```
+
+With no overlap anywhere, this is least-load, which spreads out new
+conversations. `-load-slack` (default 4) is how many extra queued requests
+are worth accepting to get a cache hit: a hit saves prefill, but waiting
+behind a busy replica costs whole decodes. Each decision is labelled with a
+reason for the metrics: `cache_hit`, `no_overlap`, or `load_override` (a
+longer prefix was cached on a replica that was over the slack).
+
+Matching, choosing and recording happen under one lock, so two turns of a
+conversation arriving together see each other's effect; hashing happens
+before the lock to keep it short.
+
+### Load tracking
+
+Load is the router's own count of in-flight requests, not vLLM's
+`num_requests_running` metric. Scraped metrics are seconds old, and in that
+window every new request would see the same "idle" replica and pile onto it.
+The router's count changes the instant a request is sent.
+
+### Observability
+
+The router exports Prometheus metrics on `/metrics`: requests by replica,
+policy, reason and status code; in-flight requests per replica; prompt and
+predicted-hit blocks; time to first byte and request duration; and its own
+routing overhead. Labels are limited to replica, policy, reason and status
+code, so the number of series stays small. Replicas export vLLM's standard
+metrics, which the dashboard combines with the router's.
+
+### Deployment
+
+```
+Terraform ──► kind cluster ──► Argo CD ──(syncs deploy/argocd from GitHub)──► router, Prometheus, Grafana
+                                                       router ──► inference replicas
+```
+
+- **Terraform** owns the infrastructure: the cluster and Argo CD, plus one
+  root Application.
+- **Argo CD** owns everything else and deploys it from git, so a push to
+  `main` updates the cluster.
+- **Kustomize** keeps one router configuration with three choices of where
+  inference runs:
+  - `mac-gpu`: vllm-metal on the Mac's GPU, reached through `ExternalName`
+    Services.
+  - `local`: mock replicas inside the cluster.
+  - `gpu`: vLLM pods on NVIDIA GPU nodes.
+- **In-cluster replicas** run as a StatefulSet behind a headless Service, so
+  each pod has its own DNS name (`vllm-0.vllm`, …). A normal Service would
+  load-balance across them and hide which replica got the request, defeating
+  the router.
+
+### Design decisions and trade-offs
+
+| Decision | Why | Cost |
+|---|---|---|
+| Character blocks, no tokenizer | No tokenizer dependency or per-request tokenization latency | Block boundaries don't match vLLM's exactly; predictions are approximate |
+| Shadow index instead of querying replicas | No extra round trip per request; works with unmodified vLLM | Can drift from the real cache |
+| Load slack instead of a weighted score | One parameter with a concrete meaning (extra queued requests accepted for a hit) | A shared system prompt can concentrate load up to the slack |
+| Router-local load counts | Instant, no herding | Each router copy sees only its own traffic |
+| A single router replica | Every request updates one shadow index | Not horizontally scalable yet; scaling needs routing by conversation in front of the routers |
+| Lock around pick and record | Concurrent turns of one conversation stay consistent | Picks are serialized; all of the router's work before proxying averaged about 0.2 ms per request in testing |
 
 ## Components
 
@@ -103,12 +216,8 @@ at startup as `KV cache size: N tokens`.
 The router runs in a local [kind](https://kind.sigs.k8s.io) cluster and is
 deployed by Argo CD from this repository; inference runs on the Mac's GPU.
 Containers on a Mac can't use the Metal GPU, so the vLLM replicas run
-natively and the cluster reaches them through `host.docker.internal`.
-
-```
-Terraform ──► kind cluster ──► Argo CD ──(syncs deploy/argocd from GitHub)──► router, Prometheus, Grafana
-                                                       router ──► vllm-metal replicas on the Mac GPU
-```
+natively and the cluster reaches them through `host.docker.internal` (see
+[Deployment](#deployment)).
 
 Requires Docker, kind, Terraform and vllm-metal (see above).
 
