@@ -13,7 +13,7 @@ import (
 )
 
 func main() {
-	addr := flag.String("addr", ":8080", "listen address")
+	addr := flag.String("addr", ":8090", "listen address (8080 is often taken by Jenkins and similar tools)")
 	backends := flag.String("backends", "http://localhost:8001,http://localhost:8002,http://localhost:8003,http://localhost:8004", "comma-separated vLLM base URLs")
 	flag.Parse()
 
