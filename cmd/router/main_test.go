@@ -6,9 +6,11 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/suchethg/llm-router/internal/backend"
+	"github.com/suchethg/llm-router/internal/policy"
 )
 
 func TestForwardsChat(t *testing.T) {
@@ -17,7 +19,7 @@ func TestForwardsChat(t *testing.T) {
 		fmt.Fprintf(w, "%s %s %s", r.Method, r.URL.Path, body)
 	}))
 	defer backend.Close()
-	router := httptest.NewServer(newHandler(mustParse(t, backend.URL)))
+	router := httptest.NewServer(newRouter(t, backend.URL))
 	defer router.Close()
 
 	resp, err := http.Post(router.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{"x":1}`))
@@ -43,7 +45,7 @@ func TestStreamsWithoutBuffering(t *testing.T) {
 		fmt.Fprint(w, "data: second\n\n")
 	}))
 	defer backend.Close()
-	router := httptest.NewServer(newHandler(mustParse(t, backend.URL)))
+	router := httptest.NewServer(newRouter(t, backend.URL))
 	defer router.Close()
 
 	resp, err := http.Post(router.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{}`))
@@ -59,7 +61,7 @@ func TestStreamsWithoutBuffering(t *testing.T) {
 }
 
 func TestUnknownRoute(t *testing.T) {
-	router := httptest.NewServer(newHandler(mustParse(t, "http://127.0.0.1:1")))
+	router := httptest.NewServer(newRouter(t, "http://127.0.0.1:1"))
 	defer router.Close()
 
 	resp, err := http.Get(router.URL + "/v1/chat/completions")
@@ -72,11 +74,49 @@ func TestUnknownRoute(t *testing.T) {
 	}
 }
 
-func mustParse(t *testing.T, s string) *url.URL {
+// Each replica answers with its own name. With round-robin, 8 requests over
+// 4 replicas must land exactly twice on each, and X-Routed-To must name the
+// replica that actually answered.
+func TestSpreadsAcrossBackends(t *testing.T) {
+	var urls []string
+	nameOf := map[string]string{} // host:port -> replica name
+	for i := 0; i < 4; i++ {
+		name := fmt.Sprint("replica-", i)
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			fmt.Fprint(w, name)
+		}))
+		defer srv.Close()
+		urls = append(urls, srv.URL)
+		nameOf[strings.TrimPrefix(srv.URL, "http://")] = name
+	}
+	router := httptest.NewServer(newRouter(t, urls...))
+	defer router.Close()
+
+	counts := map[string]int{}
+	for i := 0; i < 8; i++ {
+		resp, err := http.Post(router.URL+"/v1/chat/completions", "application/json", strings.NewReader(`{}`))
+		if err != nil {
+			t.Fatal(err)
+		}
+		served, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if routed := nameOf[resp.Header.Get("X-Routed-To")]; routed != string(served) {
+			t.Fatalf("X-Routed-To says %q but %q answered", routed, served)
+		}
+		counts[string(served)]++
+	}
+	for _, name := range nameOf {
+		if counts[name] != 2 {
+			t.Errorf("%s served %d requests, want 2 (counts %v)", name, counts[name], counts)
+		}
+	}
+}
+
+func newRouter(t *testing.T, urls ...string) http.Handler {
 	t.Helper()
-	u, err := url.Parse(s)
+	bs, err := backend.ParseList(strings.Join(urls, ","))
 	if err != nil {
 		t.Fatal(err)
 	}
-	return u
+	return newHandler(bs, &policy.RoundRobin{})
 }
