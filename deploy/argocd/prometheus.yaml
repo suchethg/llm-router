@@ -18,7 +18,8 @@ spec:
         prometheus-node-exporter: {enabled: false}
         prometheus-pushgateway: {enabled: false}
         server:
-          global: {scrape_interval: 5s}
+          # The timeout must not exceed the interval (chart default timeout: 10s).
+          global: {scrape_interval: 5s, scrape_timeout: 4s}
           persistentVolume: {enabled: false} # metrics are for live runs, not history
           resources: {requests: {cpu: 50m, memory: 256Mi}}
         # The router pod is found by its prometheus.io/scrape annotation (the
