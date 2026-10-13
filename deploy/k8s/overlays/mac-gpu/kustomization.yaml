@@ -1,0 +1,28 @@
+# Router in a local kind cluster; inference on the Mac's GPU. Containers on a
+# Mac can't reach the Metal GPU, so the vLLM replicas run natively on the host
+# (vllm-metal, see `make run-vllm-mac`) and the cluster reaches them through
+# one ExternalName Service per replica.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - host-replicas.yaml
+patches:
+  # No StatefulSet here, so the base's headless Service would have no pods.
+  - patch: |-
+      $patch: delete
+      apiVersion: v1
+      kind: Service
+      metadata:
+        name: vllm
+  # Two replicas on the host's ports, not four pods on :8000. The shadow
+  # cache size matches each replica's KV cache: 4,480 tokens / 16.
+  - target: {kind: Deployment, name: llm-router}
+    patch: |-
+      - op: replace
+        path: /spec/template/spec/containers/0/args
+        value:
+          - -addr=:8090
+          - -policy=prefix-aware
+          - -cache-blocks=280
+          - -backends=http://vllm-0:8001,http://vllm-1:8002

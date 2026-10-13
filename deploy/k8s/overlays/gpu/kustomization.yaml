@@ -1,0 +1,15 @@
+# Kubernetes nodes with NVIDIA GPUs (one 24 GB GPU per replica, e.g. L4, A10
+# or RTX 4090), with the NVIDIA GPU Operator or device plugin installed.
+# 4 vLLM replicas of Qwen3-8B, which is ungated: no Hugging Face token needed.
+#
+# The router image must be pullable by the cluster: push it to a registry
+# and set its name below, or load it onto every node.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+resources:
+  - ../../base
+  - vllm-replicas.yaml
+images:
+  - name: llm-router/router
+    newName: REGISTRY/llm-router/router # set to your registry
+    newTag: dev

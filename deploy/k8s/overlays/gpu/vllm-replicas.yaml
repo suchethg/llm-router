@@ -18,8 +18,9 @@ spec:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8000"
     spec:
+      # Label set by the NVIDIA GPU Operator / GPU feature discovery.
       nodeSelector:
-        cloud.google.com/gke-accelerator: nvidia-l4
+        nvidia.com/gpu.present: "true"
       tolerations:
         - key: nvidia.com/gpu
           operator: Exists
@@ -28,14 +29,12 @@ spec:
         - name: vllm
           image: vllm/vllm-openai:v0.30.0
           args:
-            - --model=meta-llama/Llama-3.1-8B-Instruct
+            - --model=Qwen/Qwen3-8B
             - --port=8000
             - --enable-prefix-caching
             - --gpu-memory-utilization=0.90
             - --max-model-len=8192
           env:
-            - name: HF_TOKEN
-              valueFrom: {secretKeyRef: {name: hf-token, key: token}}
             - name: HF_HOME
               value: /models
           ports:
@@ -54,7 +53,8 @@ spec:
             httpGet: {path: /health, port: http}
             periodSeconds: 15
           resources:
-            # One L4 per replica; fits a g2-standard-8 node (8 vCPU, 32 GB).
+            # One GPU per replica; Qwen3-8B in bf16 is ~16 GB of weights,
+            # leaving the rest of a 24 GB GPU for KV cache.
             requests: {cpu: "6", memory: 24Gi, nvidia.com/gpu: "1"}
             limits: {memory: 28Gi, nvidia.com/gpu: "1"}
           volumeMounts:

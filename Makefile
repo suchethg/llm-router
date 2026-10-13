@@ -1,4 +1,4 @@
-.PHONY: build test run-mocks run-router stop bench monitoring-up monitoring-down images kind-up kind-down
+.PHONY: build test run-mocks run-router stop bench monitoring-up monitoring-down images kind-up kind-down run-vllm-mac
 
 build:
 	go build -o bin/ ./cmd/...
@@ -18,6 +18,7 @@ run-router: build
 stop:
 	-pkill -f bin/mockvllm
 	-pkill -f bin/router
+	-pkill -f "vllm serve"
 
 # Compare all policies on the same multi-turn workload (fresh mocks each).
 bench:
@@ -40,13 +41,22 @@ images:
 KUBECONFIG_KIND = bin/kubeconfig
 KUBECTL_KIND = kubectl --kubeconfig $(KUBECONFIG_KIND) -n llm-router
 
+# OVERLAY=local runs 4 mocks in the cluster; OVERLAY=mac-gpu points the router
+# at vllm-metal replicas on this Mac (start them with `make run-vllm-mac`).
+OVERLAY ?= local
+
 kind-up: images
 	kind get clusters | grep -qx llm-router || kind create cluster --name llm-router --kubeconfig $(KUBECONFIG_KIND)
 	kind load docker-image --name llm-router llm-router/router:dev llm-router/mockvllm:dev
-	$(KUBECTL_KIND) apply -k deploy/k8s/overlays/local
-	$(KUBECTL_KIND) rollout restart deployment/llm-router statefulset/vllm
-	$(KUBECTL_KIND) rollout status statefulset/vllm --timeout=120s
+	$(KUBECTL_KIND) apply -k deploy/k8s/overlays/$(OVERLAY)
+	$(KUBECTL_KIND) rollout restart deployment/llm-router
 	$(KUBECTL_KIND) rollout status deployment/llm-router --timeout=120s
+	# Only the local overlay has in-cluster replicas to wait for.
+	if $(KUBECTL_KIND) get statefulset/vllm >/dev/null 2>&1; then $(KUBECTL_KIND) rollout status statefulset/vllm --timeout=120s; fi
 
 kind-down:
 	kind delete cluster --name llm-router --kubeconfig $(KUBECONFIG_KIND)
+
+# vLLM replicas on the Mac GPU (vllm-metal), ports 8001-8002. `make stop` ends them.
+run-vllm-mac:
+	scripts/vllm-mac.sh 2
