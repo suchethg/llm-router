@@ -50,6 +50,10 @@ own metrics.
 | `cmd/mockvllm` | CPU-only vLLM stand-in: same API and metric names, LRU prefix cache, prefill cost only for uncached blocks, `--max-num-seqs` queueing |
 | `cmd/loadgen` | Open-loop multi-turn chat load generator; reports TTFT percentiles and prefix-cache hit rate from replica metrics |
 | `scripts/bench.sh` | Runs each policy on freshly started replicas (cold caches) with the same workload and prints a comparison |
+| `deploy/k8s` | Kustomize manifests: router base; overlays for in-cluster mocks (`local`), Mac GPU replicas (`mac-gpu`) and NVIDIA GPU nodes (`gpu`) |
+| `deploy/terraform/onprem` | Terraform: kind cluster, Argo CD and the root Application |
+| `deploy/argocd` | Argo CD Applications: router, Prometheus, Grafana, dashboards |
+| `deploy/local` | Prometheus and Grafana in Docker Compose, for running without Kubernetes |
 
 ## Setup
 
@@ -94,10 +98,48 @@ replicas on an 18 GB Mac (each replica uses about 3.7 GB). Set
 `-cache-blocks` to the replica's KV cache size in tokens ÷ 16; vLLM logs it
 at startup as `KV cache size: N tokens`.
 
-### Monitoring
+### On-prem Kubernetes (Terraform + Argo CD)
 
-The router exports Prometheus metrics on `/metrics`. To see them with the
-replicas' vLLM metrics in Grafana (requires Docker):
+The router runs in a local [kind](https://kind.sigs.k8s.io) cluster and is
+deployed by Argo CD from this repository; inference runs on the Mac's GPU.
+Containers on a Mac can't use the Metal GPU, so the vLLM replicas run
+natively and the cluster reaches them through `host.docker.internal`.
+
+```
+Terraform ──► kind cluster ──► Argo CD ──(syncs deploy/argocd from GitHub)──► router, Prometheus, Grafana
+                                                       router ──► vllm-metal replicas on the Mac GPU
+```
+
+Requires Docker, kind, Terraform and vllm-metal (see above).
+
+```sh
+make run-vllm-mac   # 2 vLLM replicas on :8001-:8002
+make tf-up          # kind cluster + Argo CD + root Application (asks for confirmation)
+```
+
+Argo CD then deploys everything in `deploy/argocd/` and keeps it in sync
+with `main`. The cluster has its own kubeconfig, so your default `kubectl`
+context is left alone:
+
+```sh
+export KUBECONFIG=$PWD/bin/kubeconfig
+kubectl -n argocd get applications                             # all Synced/Healthy
+kubectl -n llm-router port-forward svc/llm-router 18090:8090   # the router
+kubectl -n monitoring port-forward svc/grafana 13000:80        # dashboard: http://localhost:13000
+kubectl -n argocd port-forward svc/argocd-server 8443:80       # Argo CD UI: http://localhost:8443
+```
+
+Tear down with `make tf-down` and `make stop`.
+
+For Kubernetes nodes with NVIDIA GPUs, point `deploy/argocd/router.yaml` at
+`deploy/k8s/overlays/gpu`, which runs 4 vLLM replicas of Qwen3-8B in the
+cluster.
+
+### Monitoring without Kubernetes
+
+The router exports Prometheus metrics on `/metrics`. When the router runs
+directly on the machine (not in the cluster), view them with the replicas'
+vLLM metrics in Grafana (requires Docker):
 
 ```sh
 make monitoring-up     # Grafana http://localhost:3000, Prometheus http://localhost:9090
