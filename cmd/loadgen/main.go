@@ -54,7 +54,10 @@ type config struct {
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "report" {
-		report(os.Args[2:])
+		if err := report(os.Stdout, os.Args[2:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
 		return
 	}
 
@@ -302,20 +305,24 @@ func ms(d time.Duration) float64 { return float64(d) / float64(time.Millisecond)
 // report prints a side-by-side table of summaries written with -json.
 // Several files with the same label (repeated runs of one policy) are
 // combined into one row showing the mean and the min-max range.
-func report(files []string) {
+func report(w io.Writer, files []string) error {
+	if len(files) == 0 {
+		return fmt.Errorf("usage: loadgen report SUMMARY.json...  (files written with -json)")
+	}
 	var sums []summary
 	for _, f := range files {
 		b, err := os.ReadFile(f)
 		if err != nil {
-			log.Fatal(err)
+			return err
 		}
 		var s summary
 		if err := json.Unmarshal(b, &s); err != nil {
-			log.Fatalf("%s: %v", f, err)
+			return fmt.Errorf("%s: %w", f, err)
 		}
 		sums = append(sums, s)
 	}
-	printReport(os.Stdout, sums)
+	printReport(w, sums)
+	return nil
 }
 
 func printReport(w io.Writer, sums []summary) {

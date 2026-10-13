@@ -23,9 +23,7 @@ cd "$(dirname "$0")/.."
 BACKEND=${BACKEND:-mock}
 RUNS=${RUNS:-1}
 REPLICAS=${REPLICAS:-4}
-MODEL=${MODEL:-mlx-community/Qwen3-0.6B-4bit}
-# Settings that fit 2 replicas of the 4-bit 0.6B model on an 18 GB Mac.
-VLLM_ARGS=${VLLM_ARGS:---enable-prefix-caching --gpu-memory-utilization 0.15 --max-num-seqs 8 --max-num-batched-tokens 1024 --max-model-len 4096}
+. scripts/vllm.env
 OUT=${OUT:-bench-results}
 mkdir -p "$OUT" "$OUT/logs"
 go build -o bin/ ./cmd/...

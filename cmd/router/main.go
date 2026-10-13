@@ -24,7 +24,7 @@ import (
 const maxBody = 8 << 20
 
 func main() {
-	addr := flag.String("addr", ":8090", "listen address (8080 is often taken by Jenkins and similar tools)")
+	addr := flag.String("addr", ":8090", "listen address")
 	backends := flag.String("backends", "http://localhost:8001,http://localhost:8002,http://localhost:8003,http://localhost:8004", "comma-separated vLLM base URLs")
 	policyName := flag.String("policy", "round-robin", "routing policy: round-robin | least-load | prefix-aware")
 	opts := policy.DefaultOptions()

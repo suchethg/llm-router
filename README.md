@@ -131,9 +131,13 @@ kubectl -n argocd port-forward svc/argocd-server 8443:80       # Argo CD UI: htt
 
 Tear down with `make tf-down` and `make stop`.
 
-For Kubernetes nodes with NVIDIA GPUs, point `deploy/argocd/router.yaml` at
-`deploy/k8s/overlays/gpu`, which runs 4 vLLM replicas of Qwen3-8B in the
-cluster.
+`deploy/argocd/router.yaml` chooses where inference runs by its `path`:
+
+| path | inference |
+|---|---|
+| `deploy/k8s/overlays/mac-gpu` (default) | vllm-metal replicas on the Mac GPU |
+| `deploy/k8s/overlays/local` | 4 mock replicas inside the cluster; no GPU needed |
+| `deploy/k8s/overlays/gpu` | 4 vLLM replicas of Qwen3-8B on Kubernetes nodes with NVIDIA GPUs |
 
 ### Monitoring without Kubernetes
 

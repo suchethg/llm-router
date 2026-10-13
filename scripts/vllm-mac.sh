@@ -5,8 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 N=${1:-2}
-MODEL=${MODEL:-mlx-community/Qwen3-0.6B-4bit}
-VLLM_ARGS=${VLLM_ARGS:---enable-prefix-caching --gpu-memory-utilization 0.15 --max-num-seqs 8 --max-num-batched-tokens 1024 --max-model-len 4096}
+. scripts/vllm.env
 mkdir -p bin
 for port in $(seq 8001 $((8000 + N))); do
   # Loopback only: Docker Desktop forwards host.docker.internal from kind pods

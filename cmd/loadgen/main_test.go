@@ -195,3 +195,16 @@ func TestReportCombinesRuns(t *testing.T) {
 		}
 	}
 }
+
+func TestReportNeedsFiles(t *testing.T) {
+	var b strings.Builder
+	if err := report(&b, nil); err == nil || !strings.Contains(err.Error(), "usage") {
+		t.Fatalf("report with no files: err=%v, want a usage error", err)
+	}
+	if b.Len() != 0 {
+		t.Fatalf("printed %q, want nothing", b.String())
+	}
+	if err := report(&b, []string{"does-not-exist.json"}); err == nil {
+		t.Fatal("missing file should be an error")
+	}
+}
