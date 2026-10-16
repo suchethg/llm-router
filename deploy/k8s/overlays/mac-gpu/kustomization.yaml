@@ -16,7 +16,9 @@ patches:
       metadata:
         name: vllm
   # Two replicas on the host's ports, not four pods on :8000. The shadow
-  # cache size matches each replica's KV cache: 4,480 tokens / 16.
+  # cache is 4,480 tokens / 16 = 280 blocks, at or below each replica's real
+  # KV cache (it varies per start, about 6,000-10,400 tokens): a smaller
+  # shadow only makes the router forget conversations sooner.
   - target: {kind: Deployment, name: llm-router}
     patch: |-
       - op: replace
