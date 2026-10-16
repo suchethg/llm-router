@@ -9,21 +9,54 @@ conversation's turns across replicas, so most turns pay full prefill again.
 This router sends each request to the replica most likely to have its prompt
 prefix cached, as long as that replica isn't overloaded.
 
+```mermaid
+flowchart TB
+    subgraph RR["Round-robin: history scattered"]
+        direction LR
+        rt1["Turn 1"] --> rr1["Replica 1<br/>caches turn 1"]
+        rt2["Turn 2"] --> rr2["Replica 2<br/>cache miss"]
+        rt3["Turn 3"] --> rr3["Replica 3<br/>cache miss"]
+    end
+    subgraph PA["Prefix-aware: history reused"]
+        direction LR
+        pt1["Turn 1"] --> pr1["Replica 1<br/>caches turn 1, then 2, then 3"]
+        pt2["Turn 2"] --> pr1
+        pt3["Turn 3"] --> pr1
+    end
+    RR ~~~ PA
+```
+
+**GPU inference.** The router has been run and benchmarked against real vLLM
+inference on an **Apple Silicon GPU** (M3 Pro, through
+[vllm-metal](https://docs.vllm.ai/projects/vllm-metal), which runs vLLM on
+Metal/MLX). Kubernetes manifests for **NVIDIA GPU** nodes
+(`deploy/k8s/overlays/gpu`) are included, but haven't been run on NVIDIA
+hardware yet.
+
 ## Design
 
 ### Architecture
 
-```
-                          ┌──────────────────────────── router ────────────────────────────┐
-                          │                                                                │
- client ── POST /v1/chat/ │  read body ─► render chat ─► policy.Pick ─► reverse proxy ─────┼──► replica 1 (vLLM)
-           completions ──►│  (≤ 8 MiB)    + hash blocks    │              (streams SSE)    ├──► replica 2
-                          │                                ▼                               ├──► ...
-                          │              per replica: shadow LRU of block hashes,          │
-                          │                           in-flight request count              │
-                          │                                                                │
-                          │  GET /metrics ◄── Prometheus ──► each replica's /metrics       │
-                          └────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    C["Client<br/>OpenAI chat API"] -->|"POST /v1/chat/completions"| H
+
+    subgraph R["Router (Go)"]
+        H["Read body<br/>(up to 8 MiB)"] --> RC["Render chat and<br/>hash prompt blocks"]
+        RC --> PO{"Policy<br/>prefix-aware"}
+        SI[("Shadow index<br/>per replica")] -.-> PO
+        IF[("In-flight count<br/>per replica")] -.-> PO
+        PO --> RP["Reverse proxy<br/>streams tokens"]
+        MX["GET /metrics"]
+    end
+
+    RP --> V1["vLLM replica 1"]
+    RP --> V2["vLLM replica 2"]
+    RP --> VN["vLLM replica N"]
+
+    PR[("Prometheus")] -->|scrape| MX
+    PR -->|scrape| V1 & V2 & VN
+    GF["Grafana"] --> PR
 ```
 
 The router is a single Go binary with no external state. It speaks the
@@ -31,6 +64,24 @@ OpenAI chat completions API on both sides, so clients and vLLM replicas need
 no changes.
 
 ### Request lifecycle
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant R as Router
+    participant P as Policy
+    participant V as vLLM replica
+    C->>R: POST /v1/chat/completions (whole conversation)
+    R->>R: Read body, render messages, hash into blocks
+    R->>P: Pick(prompt blocks)
+    P->>P: Snapshot loads, keep replicas within load slack,<br/>find longest cached prefix in shadow index
+    P-->>R: Decision: replica, matched blocks, reason
+    R->>R: In-flight count +1
+    R->>V: Forward request
+    V-->>R: Stream tokens (server-sent events)
+    R-->>C: Stream tokens, header X-Routed-To
+    R->>R: In-flight count -1, record metrics
+```
 
 1. **Read** the body (up to 8 MiB; larger is rejected with 413) and parse the
    `messages`. A body that can't be parsed is still forwarded unchanged and
@@ -59,10 +110,29 @@ key(block i) = hash(key(block i-1) ‖ text of block i)
 
 So one key stands for the entire prompt up to that block: block *i* is only
 reusable if everything before it matches too. Multi-turn chat fits this
-exactly, since every turn resends the earlier turns unchanged as a prefix.
-The router computes the same kind of keys (`internal/prefix`). It has no
-tokenizer, so blocks are 64 characters (about vLLM's 16 tokens), and a final
-partial block is dropped, as vLLM only caches full blocks.
+exactly, since every turn resends the earlier turns unchanged as a prefix:
+
+```mermaid
+flowchart TB
+    subgraph T1["Turn 1 prompt"]
+        direction LR
+        a1["key 1"] --> a2["key 2"] --> a3["key 3"]
+    end
+    subgraph T2["Turn 2 prompt = turn 1 + new messages"]
+        direction LR
+        b1["key 1"] --> b2["key 2"] --> b3["key 3"] --> b4["key 4"] --> b5["key 5"]
+    end
+    T1 ~~~ T2
+    class a1,a2,a3,b1,b2,b3 hit
+    class b4,b5 miss
+    classDef hit fill:#2e7d32,stroke:#1b5e20,color:#fff
+    classDef miss fill:#9e9e9e,stroke:#616161,color:#fff
+```
+
+Green blocks are already cached from turn 1, so only the grey ones cost
+prefill. The router computes the same kind of keys (`internal/prefix`). It
+has no tokenizer, so blocks are 64 characters (about vLLM's 16 tokens), and a
+final partial block is dropped, as vLLM only caches full blocks.
 
 ### Shadow index
 
@@ -84,17 +154,23 @@ router's predicted hit rate next to vLLM's actual one so drift is visible.
 
 `prefix-aware`, step by step:
 
-```
-loads    = in-flight count of every replica (one snapshot)
-eligible = replicas with load <= min(loads) + load_slack
-choice   = eligible replica with the longest cached prefix in its shadow index,
-           ties going to the lower load
-record the prompt's blocks in choice's shadow index
+```mermaid
+flowchart TD
+    A["Request: prompt as block keys"] --> B["Snapshot in-flight load of every replica"]
+    B --> C["Eligible = replicas with load at most lowest load + load slack"]
+    C --> D["For each eligible replica: longest run of the prompt's keys in its shadow index"]
+    D --> E["Choose the longest match; ties go to the lower load"]
+    E --> F["Record the prompt's keys in the chosen replica's shadow index"]
+    F --> G{"Was a longer prefix cached on a replica over the slack?"}
+    G -->|yes| R1["reason: load_override"]
+    G -->|no| H{"Any blocks matched?"}
+    H -->|yes| R2["reason: cache_hit"]
+    H -->|no| R3["reason: no_overlap (same as least-load)"]
 ```
 
 With no overlap anywhere, this is least-load, which spreads out new
-conversations. `-load-slack` (default 4) is how many extra queued requests
-are worth accepting to get a cache hit: a hit saves prefill, but waiting
+conversations. `-load-slack` (default 4) is how many extra in-flight
+requests are worth accepting to get a cache hit: a hit saves prefill, but waiting
 behind a busy replica costs whole decodes. Each decision is labelled with a
 reason for the metrics: `cache_hit`, `no_overlap`, or `load_override` (a
 longer prefix was cached on a replica that was over the slack).
@@ -121,9 +197,27 @@ metrics, which the dashboard combines with the router's.
 
 ### Deployment
 
-```
-Terraform ──► kind cluster ──► Argo CD ──(syncs deploy/argocd from GitHub)──► router, Prometheus, Grafana
-                                                       router ──► inference replicas
+```mermaid
+flowchart LR
+    GH[("GitHub repo<br/>deploy/argocd")]
+    subgraph Mac["Mac (on-prem)"]
+        TF["Terraform"]
+        subgraph K["kind cluster"]
+            AR["Argo CD"]
+            RT["Router"]
+            PM[("Prometheus")]
+            GF["Grafana"]
+        end
+        V1["vllm-metal replica :8001<br/>Mac GPU"]
+        V2["vllm-metal replica :8002<br/>Mac GPU"]
+    end
+    TF -->|creates| K
+    TF -->|installs| AR
+    GH -->|"syncs"| AR
+    AR -->|deploys| RT & PM & GF
+    RT -->|"host.docker.internal"| V1 & V2
+    PM -->|scrape| RT & V1 & V2
+    GF --> PM
 ```
 
 - **Terraform** owns the infrastructure: the cluster and Argo CD, plus one
@@ -147,7 +241,7 @@ Terraform ──► kind cluster ──► Argo CD ──(syncs deploy/argocd fr
 |---|---|---|
 | Character blocks, no tokenizer | No tokenizer dependency or per-request tokenization latency | Block boundaries don't match vLLM's exactly; predictions are approximate |
 | Shadow index instead of querying replicas | No extra round trip per request; works with unmodified vLLM | Can drift from the real cache |
-| Load slack instead of a weighted score | One parameter with a concrete meaning (extra queued requests accepted for a hit) | A shared system prompt can concentrate load up to the slack |
+| Load slack instead of a weighted score | One parameter with a concrete meaning (extra in-flight requests accepted for a hit) | A shared system prompt can concentrate load up to the slack |
 | Router-local load counts | Instant, no herding | Each router copy sees only its own traffic |
 | A single router replica | Every request updates one shadow index | Not horizontally scalable yet; scaling needs routing by conversation in front of the routers |
 | Lock around pick and record | Concurrent turns of one conversation stay consistent | Picks are serialized; all of the router's work before proxying averaged about 0.2 ms per request in testing |
@@ -156,13 +250,15 @@ Terraform ──► kind cluster ──► Argo CD ──(syncs deploy/argocd fr
 
 | Path | What it is |
 |---|---|
-| `cmd/router` | The router: OpenAI-compatible `POST /v1/chat/completions` proxy with streaming, `GET /healthz` |
+| `cmd/router` | The router: OpenAI-compatible `POST /v1/chat/completions` proxy with streaming, `GET /metrics`, `GET /healthz` |
 | `internal/policy` | `round-robin` and `least-load` (baselines), `prefix-aware` |
 | `internal/prefix` | Chat rendering, chained block hashing, LRU |
 | `internal/backend` | Replica list, per-replica reverse proxy, in-flight counter |
-| `cmd/mockvllm` | CPU-only vLLM stand-in: same API and metric names, LRU prefix cache, prefill cost only for uncached blocks, `--max-num-seqs` queueing |
+| `cmd/mockvllm` | CPU-only vLLM stand-in: same API and metric names, LRU prefix cache, prefill cost only for uncached blocks, queueing like vLLM's `--max-num-seqs` |
 | `cmd/loadgen` | Open-loop multi-turn chat load generator; reports TTFT percentiles and prefix-cache hit rate from replica metrics |
-| `scripts/bench.sh` | Runs each policy on freshly started replicas (cold caches) with the same workload and prints a comparison |
+| `scripts/bench.sh` | Runs each policy on freshly started replicas (cold caches) with the same workload and prints a comparison; `RUNS=N` repeats with different seeds |
+| `scripts/vllm-mac.sh`, `scripts/vllm.env` | Start vllm-metal replicas on the Mac GPU; the model and vLLM settings they share with `bench.sh` |
+| `Dockerfile` | Builds any program in `cmd/` into a small distroless image |
 | `deploy/k8s` | Kustomize manifests: router base; overlays for in-cluster mocks (`local`), Mac GPU replicas (`mac-gpu`) and NVIDIA GPU nodes (`gpu`) |
 | `deploy/terraform/onprem` | Terraform: kind cluster, Argo CD and the root Application |
 | `deploy/argocd` | Argo CD Applications: router, Prometheus, Grafana, dashboards |
@@ -207,9 +303,15 @@ LOADGEN_ARGS="-rate 1 -sys-prompts 4 -sys-chars 800 -turns 6 -user-chars 200 -ma
 ```
 
 Defaults start `mlx-community/Qwen3-0.6B-4bit` with settings that fit two
-replicas on an 18 GB Mac (each replica uses about 3.7 GB). Set
-`-cache-blocks` to the replica's KV cache size in tokens ÷ 16; vLLM logs it
-at startup as `KV cache size: N tokens`.
+replicas on an 18 GB Mac (each replica uses about 3.7 GB).
+
+`-cache-blocks` should match a replica's KV cache: its size in tokens ÷ 16.
+vllm-metal logs the size at startup as `CPU KV cache size: N tokens` (on
+Apple Silicon this is the same unified memory the GPU uses). With these
+settings it varies from start to start, between about 6,000 and 10,400
+tokens, so check the log. A value below the real size, like the 280 blocks
+(4,480 tokens) above, is safe but makes the router forget conversations
+sooner than vLLM does, so it understates the gain.
 
 ### On-prem Kubernetes (Terraform + Argo CD)
 
@@ -219,7 +321,7 @@ Containers on a Mac can't use the Metal GPU, so the vLLM replicas run
 natively and the cluster reaches them through `host.docker.internal` (see
 [Deployment](#deployment)).
 
-Requires Docker, kind, Terraform and vllm-metal (see above).
+Requires Docker, kind, kubectl, Terraform and vllm-metal (see above).
 
 ```sh
 make run-vllm-mac   # 2 vLLM replicas on :8001-:8002
@@ -246,7 +348,7 @@ Tear down with `make tf-down` and `make stop`.
 |---|---|
 | `deploy/k8s/overlays/mac-gpu` (default) | vllm-metal replicas on the Mac GPU |
 | `deploy/k8s/overlays/local` | 4 mock replicas inside the cluster; no GPU needed |
-| `deploy/k8s/overlays/gpu` | 4 vLLM replicas of Qwen3-8B on Kubernetes nodes with NVIDIA GPUs |
+| `deploy/k8s/overlays/gpu` | 4 vLLM replicas of Qwen3-8B on Kubernetes nodes with NVIDIA GPUs; push the router image to a registry and set it in the overlay first |
 
 ### Monitoring without Kubernetes
 
